@@ -87,18 +87,34 @@ assistant = None
 call_py = None
 CALL_CLIENT = None  # client instance used by PyTgCalls (assistant or user_app)
 
+# Try to set up assistant / PyTgCalls in a safe way.
 if ASSISTANT_SESSION:
     assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string=ASSISTANT_SESSION, in_memory=True)
     CALL_CLIENT = assistant
     if PyTgCalls:
-        call_py = PyTgCalls(assistant)
+        try:
+            # Creating the PyTgCalls instance may import additional pyrogram internals
+            # which can raise ImportError if pyrogram/pytgcalls versions mismatch.
+            call_py = PyTgCalls(assistant)
+        except Exception as e:
+            logger.warning("Failed to initialize PyTgCalls with assistant account. Voice playback disabled.")
+            logger.debug(f"PyTgCalls init error: {e}", exc_info=True)
+            call_py = None
+            # mark PyTgCalls as unavailable to avoid further instantiation attempts
+            PyTgCalls = None
     else:
         logger.warning("pytgcalls not available - voice playback disabled.")
 else:
     # Use userbot's client for voice if pytgcalls is present and assistant isn't configured.
     CALL_CLIENT = user_app
     if PyTgCalls:
-        call_py = PyTgCalls(user_app)
+        try:
+            call_py = PyTgCalls(user_app)
+        except Exception as e:
+            logger.warning("Failed to initialize PyTgCalls with user account. Voice playback disabled.")
+            logger.debug(f"PyTgCalls init error: {e}", exc_info=True)
+            call_py = None
+            PyTgCalls = None
     else:
         logger.info("pytgcalls not available - voice playback disabled (no assistant).")
 
@@ -557,7 +573,12 @@ async def play_entry(chat_id: int, entry: dict, reply_message: Optional[Message]
                     return False
 
         # Call play on the active PyTgCalls instance
-        await _safe_call_py_method("play", chat_id, MediaStream(stream_source))
+        # Note: MediaStream may be None if pytgcalls types failed to import; _safe_call_py_method will handle
+        if MediaStream is not None:
+            await _safe_call_py_method("play", chat_id, MediaStream(stream_source))
+        else:
+            # fallback: try to call play with raw source
+            await _safe_call_py_method("play", chat_id, stream_source)
 
         thumb_path = None
         thumb_val = entry.get("thumbnail")
