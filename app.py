@@ -471,6 +471,8 @@ async def leave_voice_chat(chat_id: int):
             try:
                 await _safe_call_py_method("leave_call", chat_id)
                 await _safe_call_py_method("stop", chat_id)
+                # Some pytgcalls versions use "leave_group_call"
+                await _safe_call_py_method("leave_group_call", chat_id)
             except Exception:
                 pass
     except Exception as e:
@@ -525,6 +527,64 @@ async def prepare_entry_from_reply(reply_msg: Message) -> Optional[Dict[str, Any
         logger.debug(f"prepare_entry_from_reply failed: {e}")
         return None
 
+# New helper: ensure CALL_CLIENT (assistant or user) is a member of the chat & try to auto-join
+async def ensure_call_client_in_chat(chat_id: int) -> bool:
+    """
+    Ensure CALL_CLIENT (assistant or user_app) is present in the chat.
+    If CALL_CLIENT is the assistant account and it's not present, try to create an invite link
+    and have the assistant join it. Return True if present/joined, False otherwise.
+    """
+    if CALL_CLIENT is None or CALL_CLIENT == user_app:
+        # user_app is always considered present (it runs actions). We still check membership; some groups restrict messaging.
+        return True
+    try:
+        me = await CALL_CLIENT.get_me()
+        assistant_id = me.id
+    except Exception:
+        assistant_id = None
+
+    if not assistant_id:
+        logger.debug("Could not get assistant ID")
+        return False
+
+    try:
+        await CALL_CLIENT.get_chat_member(chat_id, assistant_id)
+        return True
+    except Exception:
+        # assistant not in chat
+        logger.info("Assistant not present in chat, attempting to invite via owner account...")
+        try:
+            # create invite link with user_app (owner) and try to join assistant through link
+            invite = await user_app.create_chat_invite_link(chat_id, member_limit=1, name="dlk_assistant_invite")
+            invite_link = invite.invite_link
+            try:
+                # Some pyrogram versions accept join_chat on user accounts for invite links
+                await CALL_CLIENT.join_chat(invite_link)
+                # small delay to ensure presence
+                await asyncio.sleep(1)
+                # confirm membership
+                try:
+                    await CALL_CLIENT.get_chat_member(chat_id, assistant_id)
+                    return True
+                except Exception:
+                    return False
+            except Exception as e:
+                logger.warning(f"Assistant failed to join via invite link: {e}")
+                # notify owner so they can add assistant manually
+                try:
+                    await user_app.send_message(chat_id, "Assistant not in group. Add the assistant account to the group and retry.")
+                    await user_app.send_message(chat_id, invite_link)
+                except Exception:
+                    pass
+                return False
+        except Exception as e:
+            logger.warning(f"Could not create invite link to add assistant: {e}")
+            try:
+                await user_app.send_message(chat_id, "Assistant not in the group and could not create an invite link. Please add the assistant user manually and retry.")
+            except Exception:
+                pass
+            return False
+
 async def play_entry(chat_id: int, entry: dict, reply_message: Optional[Message] = None):
     try:
         if chat_id in radio_tasks:
@@ -540,45 +600,57 @@ async def play_entry(chat_id: int, entry: dict, reply_message: Optional[Message]
                 pass
             return True
 
-        # If the PyTgCalls instance is using assistant, ensure assistant is present in the chat.
+        # If the PyTgCalls instance is using assistant, ensure assistant is present in the chat
         if CALL_CLIENT is not None and CALL_CLIENT != user_app:
-            # CALL_CLIENT is assistant: make sure assistant is in chat
-            try:
-                assistant_user = await CALL_CLIENT.get_me()
-                assistant_id = assistant_user.id
-            except Exception:
-                assistant_id = None
-            assistant_present = False
-            if assistant_id:
-                try:
-                    await CALL_CLIENT.get_chat_member(chat_id, assistant_id)
-                    assistant_present = True
-                except Exception:
-                    assistant_present = False
-            if not assistant_present:
-                # try inviting assistant
-                try:
-                    invite = await user_app.create_chat_invite_link(chat_id, member_limit=1, name="dlk_assistant_invite")
-                    invite_link = invite.invite_link
-                    try:
-                        await CALL_CLIENT.join_chat(invite_link)
-                        assistant_present = True
-                    except Exception:
-                        # cannot auto-join assistant
-                        await user_app.send_message(chat_id, "Assistant not in group. Add it via invite link and retry.")
-                        await user_app.send_message(chat_id, invite_link)
-                        return False
-                except Exception:
-                    await user_app.send_message(chat_id, "Assistant not in this group. Please add the assistant account and try again.")
-                    return False
+            assistant_ok = await ensure_call_client_in_chat(chat_id)
+            if not assistant_ok:
+                # ensure_call_client_in_chat already attempted to notify the chat/owner
+                return False
 
-        # Call play on the active PyTgCalls instance
-        # Note: MediaStream may be None if pytgcalls types failed to import; _safe_call_py_method will handle
-        if MediaStream is not None:
-            await _safe_call_py_method("play", chat_id, MediaStream(stream_source))
-        else:
-            # fallback: try to call play with raw source
-            await _safe_call_py_method("play", chat_id, stream_source)
+        # Try to join the voice chat / group call before playing.
+        # Different PyTgCalls versions have different method names/signatures; try multiple safe calls.
+        joined_success = False
+        try:
+            # Preferred: join_group_call with a MediaStream if available
+            if MediaStream is not None:
+                res = await _safe_call_py_method("join_group_call", chat_id, MediaStream(stream_source))
+                if res is not None:
+                    joined_success = True
+                else:
+                    res = await _safe_call_py_method("join_call", chat_id, MediaStream(stream_source))
+                    if res is not None:
+                        joined_success = True
+            # Fallback: some versions accept join_group_call without stream, then play
+            if not joined_success:
+                res = await _safe_call_py_method("join_group_call", chat_id)
+                if res is not None:
+                    joined_success = True
+            if not joined_success:
+                res = await _safe_call_py_method("join_call", chat_id)
+                if res is not None:
+                    joined_success = True
+        except Exception as e:
+            logger.debug(f"Join attempts raised: {e}")
+
+        # If we couldn't join via explicit join_* calls, still try to call play (some versions auto-join)
+        play_result = None
+        try:
+            if MediaStream is not None:
+                play_result = await _safe_call_py_method("play", chat_id, MediaStream(stream_source))
+            else:
+                play_result = await _safe_call_py_method("play", chat_id, stream_source)
+        except Exception as e:
+            logger.debug(f"call_py.play attempt failed: {e}")
+            play_result = None
+
+        # If neither join nor play succeeded, fallback to posting the URL in chat
+        if play_result is None and not joined_success:
+            logger.warning("Failed to start voice playback. Falling back to posting link in chat.")
+            try:
+                await user_app.send_message(chat_id, f"▶️ Now playing: {entry.get('title')}\n{stream_source}")
+            except Exception:
+                pass
+            return False
 
         thumb_path = None
         thumb_val = entry.get("thumbnail")
