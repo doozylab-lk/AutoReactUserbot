@@ -945,7 +945,7 @@ async def cmd_stations(client: Client, message: Message):
         lines.append(f"- {name}: {url}")
     await message.reply_text("\n".join(lines))
 
-@user_app.on_message(filters.command("play", prefixes=["!", "/"]) & (filters.group | filters.channel))
+@user_app.on_message(filters.command("play", prefixes=["!", "/"]) & (filters.group | filters.channel | filters.private | filters.me))
 async def cmd_play(_, message: Message):
     chat_id = message.chat.id
     entry = None
