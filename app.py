@@ -2,10 +2,9 @@
 """
 Userbot-only combined app.py
 - Inline buttons and callbacks are handled by the user account.
-- Voice playback uses an assistant account (ASSISTANT_SESSION) + pytgcalls when available,
-  or uses the userbot account's PyTgCalls if ASSISTANT_SESSION is not provided.
+- Voice playback uses the user account's PyTgCalls (no assistant account required).
 - YouTube playback (extract) uses yt-dlp (yt_dlp).
-Replace existing app.py with this file.
+Replace existing app.py with this file and set SESSION_STRING for your user account.
 """
 import os
 import re
@@ -60,8 +59,7 @@ logger = logging.getLogger("dlk_userbot")
 # ===================== ENV / CONFIG =====================
 API_ID = int(os.environ.get("API_ID", "0") or 0)
 API_HASH = os.environ.get("API_HASH", "") or ""
-SESSION_STRING = os.environ.get("SESSION_STRING")
-ASSISTANT_SESSION = os.environ.get("ASSISTANT_SESSION")  # assistant user session string (optional)
+SESSION_STRING = os.environ.get("SESSION_STRING")  # user session string (required)
 MONGO_URI = os.environ.get("MONGO_URI", "")
 MONGO_DBNAME = os.environ.get("MONGO_DBNAME", "dlk_radio")
 OWNER_ID_ENV = os.environ.get("OWNER_ID")
@@ -73,6 +71,9 @@ INLINE_CONTROLS = os.environ.get("INLINE_CONTROLS", "1") != "0"
 if not API_ID or not API_HASH:
     logger.critical("API_ID and API_HASH must be set in environment")
     raise SystemExit(1)
+if not SESSION_STRING:
+    logger.critical("SESSION_STRING (user session) must be set in environment for userbot-only mode")
+    raise SystemExit(1)
 
 # ===================== CLIENTS =====================
 user_app = Client(
@@ -83,43 +84,21 @@ user_app = Client(
     in_memory=True,
 )
 
-assistant = None
+assistant = None  # no assistant in user-only mode
 call_py = None
-CALL_CLIENT = None  # client instance used by PyTgCalls (assistant or user_app)
+CALL_CLIENT = user_app  # always use the user account for calls
 
-# Try to set up assistant / PyTgCalls in a safe way.
-if ASSISTANT_SESSION:
-    assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string=ASSISTANT_SESSION, in_memory=True)
-    CALL_CLIENT = assistant
-    if PyTgCalls:
-        try:
-            # Creating the PyTgCalls instance may import additional pyrogram internals
-            # which can raise ImportError if pyrogram/pytgcalls versions mismatch.
-            call_py = PyTgCalls(assistant)
-        except Exception as e:
-            logger.warning("Failed to initialize PyTgCalls with assistant account. Voice playback disabled.")
-            logger.debug(f"PyTgCalls init error: {e}", exc_info=True)
-            call_py = None
-            # mark PyTgCalls as unavailable to avoid further instantiation attempts
-            PyTgCalls = None
-    else:
-        logger.warning("pytgcalls not available - voice playback disabled.")
+# Try to set up PyTgCalls attached to the user account
+if PyTgCalls:
+    try:
+        call_py = PyTgCalls(user_app)
+    except Exception as e:
+        logger.warning("Failed to initialize PyTgCalls with user account. Voice playback disabled.")
+        logger.debug(f"PyTgCalls init error: {e}", exc_info=True)
+        call_py = None
+        PyTgCalls = None
 else:
-    # Use userbot's client for voice if pytgcalls is present and assistant isn't configured.
-    CALL_CLIENT = user_app
-    if PyTgCalls:
-        try:
-            call_py = PyTgCalls(user_app)
-        except Exception as e:
-            logger.warning("Failed to initialize PyTgCalls with user account. Voice playback disabled.")
-            logger.debug(f"PyTgCalls init error: {e}", exc_info=True)
-            call_py = None
-            PyTgCalls = None
-    else:
-        logger.info("pytgcalls not available - voice playback disabled (no assistant).")
-
-if not ASSISTANT_SESSION:
-    logger.info("ASSISTANT_SESSION not provided — attempting to use user account for VC if pytgcalls available.")
+    logger.info("pytgcalls not available - voice playback disabled.")
 
 # ===================== DB SETUP =====================
 mongo_client = None
@@ -224,7 +203,7 @@ async def ensure_owner_id():
     load_caches_for_owner(OWNER_ID)
     logger.info(f"Owner user id: {OWNER_ID}")
 
-# ===================== THUMB / IMAGE HELPERS (trimmed) =====================
+# ===================== THUMB / IMAGE HELPERS =====================
 def clear_title(text: str) -> str:
     parts = (text or "").split(" ")
     title = ""
@@ -333,7 +312,6 @@ async def get_thumb_from_url_or_webpage(thumbnail_url: Optional[str], webpage: O
                 except Exception:
                     pass
                 return processed
-    # fallback not implemented fully (keeps simple)
     return None
 
 # ===================== YT / stream extraction =====================
@@ -471,7 +449,6 @@ async def leave_voice_chat(chat_id: int):
             try:
                 await _safe_call_py_method("leave_call", chat_id)
                 await _safe_call_py_method("stop", chat_id)
-                # Some pytgcalls versions use "leave_group_call"
                 await _safe_call_py_method("leave_group_call", chat_id)
             except Exception:
                 pass
@@ -527,91 +504,22 @@ async def prepare_entry_from_reply(reply_msg: Message) -> Optional[Dict[str, Any
         logger.debug(f"prepare_entry_from_reply failed: {e}")
         return None
 
-# New helper: ensure CALL_CLIENT (assistant or user) is a member of the chat & try to auto-join
-async def ensure_call_client_in_chat(chat_id: int) -> bool:
-    """
-    Ensure CALL_CLIENT (assistant or user_app) is present in the chat.
-    If CALL_CLIENT is the assistant account and it's not present, try to create an invite link
-    and have the assistant join it. Return True if present/joined, False otherwise.
-    """
-    if CALL_CLIENT is None or CALL_CLIENT == user_app:
-        # user_app is always considered present (it runs actions). We still check membership; some groups restrict messaging.
-        return True
-    try:
-        me = await CALL_CLIENT.get_me()
-        assistant_id = me.id
-    except Exception:
-        assistant_id = None
-
-    if not assistant_id:
-        logger.debug("Could not get assistant ID")
-        return False
-
-    try:
-        await CALL_CLIENT.get_chat_member(chat_id, assistant_id)
-        return True
-    except Exception:
-        # assistant not in chat
-        logger.info("Assistant not present in chat, attempting to invite via owner account...")
-        try:
-            # create invite link with user_app (owner) and try to join assistant through link
-            invite = await user_app.create_chat_invite_link(chat_id, member_limit=1, name="dlk_assistant_invite")
-            invite_link = invite.invite_link
-            try:
-                # Some pyrogram versions accept join_chat on user accounts for invite links
-                await CALL_CLIENT.join_chat(invite_link)
-                # small delay to ensure presence
-                await asyncio.sleep(1)
-                # confirm membership
-                try:
-                    await CALL_CLIENT.get_chat_member(chat_id, assistant_id)
-                    return True
-                except Exception:
-                    return False
-            except Exception as e:
-                logger.warning(f"Assistant failed to join via invite link: {e}")
-                # notify owner so they can add assistant manually
-                try:
-                    await user_app.send_message(chat_id, "Assistant not in group. Add the assistant account to the group and retry.")
-                    await user_app.send_message(chat_id, invite_link)
-                except Exception:
-                    pass
-                return False
-        except Exception as e:
-            logger.warning(f"Could not create invite link to add assistant: {e}")
-            try:
-                await user_app.send_message(chat_id, "Assistant not in the group and could not create an invite link. Please add the assistant user manually and retry.")
-            except Exception:
-                pass
-            return False
-
 async def play_entry(chat_id: int, entry: dict, reply_message: Optional[Message] = None):
     try:
         if chat_id in radio_tasks:
             radio_tasks[chat_id].cancel()
             radio_tasks.pop(chat_id, None)
         stream_source = entry["stream_url"]
-        # play via call_py (either assistant or user account)
+        # play via call_py (user account)
         if not call_py:
-            # fallback: just post the link
             try:
                 await user_app.send_message(chat_id, f"▶️ Now playing: {entry.get('title')}\n{stream_source}")
             except Exception:
                 pass
             return True
-
-        # If the PyTgCalls instance is using assistant, ensure assistant is present in the chat
-        if CALL_CLIENT is not None and CALL_CLIENT != user_app:
-            assistant_ok = await ensure_call_client_in_chat(chat_id)
-            if not assistant_ok:
-                # ensure_call_client_in_chat already attempted to notify the chat/owner
-                return False
-
-        # Try to join the voice chat / group call before playing.
-        # Different PyTgCalls versions have different method names/signatures; try multiple safe calls.
+        # Try join + play using PyTgCalls
         joined_success = False
         try:
-            # Preferred: join_group_call with a MediaStream if available
             if MediaStream is not None:
                 res = await _safe_call_py_method("join_group_call", chat_id, MediaStream(stream_source))
                 if res is not None:
@@ -620,7 +528,6 @@ async def play_entry(chat_id: int, entry: dict, reply_message: Optional[Message]
                     res = await _safe_call_py_method("join_call", chat_id, MediaStream(stream_source))
                     if res is not None:
                         joined_success = True
-            # Fallback: some versions accept join_group_call without stream, then play
             if not joined_success:
                 res = await _safe_call_py_method("join_group_call", chat_id)
                 if res is not None:
@@ -631,8 +538,6 @@ async def play_entry(chat_id: int, entry: dict, reply_message: Optional[Message]
                     joined_success = True
         except Exception as e:
             logger.debug(f"Join attempts raised: {e}")
-
-        # If we couldn't join via explicit join_* calls, still try to call play (some versions auto-join)
         play_result = None
         try:
             if MediaStream is not None:
@@ -642,8 +547,6 @@ async def play_entry(chat_id: int, entry: dict, reply_message: Optional[Message]
         except Exception as e:
             logger.debug(f"call_py.play attempt failed: {e}")
             play_result = None
-
-        # If neither join nor play succeeded, fallback to posting the URL in chat
         if play_result is None and not joined_success:
             logger.warning("Failed to start voice playback. Falling back to posting link in chat.")
             try:
@@ -651,7 +554,6 @@ async def play_entry(chat_id: int, entry: dict, reply_message: Optional[Message]
             except Exception:
                 pass
             return False
-
         thumb_path = None
         thumb_val = entry.get("thumbnail")
         title = entry.get("title") or "Unknown"
@@ -661,7 +563,6 @@ async def play_entry(chat_id: int, entry: dict, reply_message: Optional[Message]
             thumb_path = await get_thumb_from_url_or_webpage(thumb_val, entry.get("webpage"), title)
         else:
             thumb_path = None
-
         if thumb_path and os.path.isfile(thumb_path):
             try:
                 msg = await user_app.send_photo(chat_id, photo=thumb_path, caption=f"🎧 Now Playing: {title}", reply_markup=player_controls_markup(chat_id))
@@ -669,7 +570,6 @@ async def play_entry(chat_id: int, entry: dict, reply_message: Optional[Message]
                 msg = await user_app.send_photo(chat_id, photo="https://files.catbox.moe/3o9qj5.jpg", caption=f"🎧 Now Playing: {title}", reply_markup=player_controls_markup(chat_id))
         else:
             msg = await user_app.send_photo(chat_id, photo="https://files.catbox.moe/3o9qj5.jpg", caption=f"🎧 Now Playing: {title}", reply_markup=player_controls_markup(chat_id))
-
         start_time = time.time()
         store_play_state(chat_id, title, entry.get("stream_url"), msg.id, start_time, elapsed=0.0, paused=False)
         radio_tasks[chat_id] = asyncio.create_task(update_radio_timer(chat_id, msg.id, title, start_time))
@@ -715,8 +615,26 @@ async def track_watcher(chat_id: int, duration: int, msg_id: int):
 
 # ===================== UI: radio menu + controls =====================
 def radio_buttons(page: int = 0, per_page: int = 6):
-    # Inline radio buttons removed — return None to avoid showing them.
-    return None
+    stations = sorted(RADIO_STATION.keys())
+    total_pages = (len(stations) - 1) // per_page + 1
+    start = page * per_page
+    end = start + per_page
+    current = stations[start:end]
+    buttons = []
+    for i in range(0, len(current), 2):
+        row = [InlineKeyboardButton(current[i], callback_data=f"radio_play_{current[i]}")]
+        if i + 1 < len(current):
+            row.append(InlineKeyboardButton(current[i+1], callback_data=f"radio_play_{current[i+1]}"))
+        buttons.append(row)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◁", callback_data=f"radio_page_{page-1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("▷", callback_data=f"radio_page_{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("❌ Close Menu", callback_data="radio_close")])
+    return InlineKeyboardMarkup(buttons)
 
 # ===================== PRIVILEGE CHECK =====================
 async def dlk_privilege_validator(subject: Any) -> bool:
@@ -756,7 +674,6 @@ async def dlk_privilege_validator(subject: Any) -> bool:
 
 # ===================== COMMANDS & CALLBACKS =====================
 
-# help
 @user_app.on_message(filters.command("help", prefixes=["!", "/"]) & filters.me)
 async def user_help(client: Client, message: Message):
     await ensure_owner_id()
@@ -765,11 +682,10 @@ async def user_help(client: Client, message: Message):
         "!react - Post control buttons to toggle Auto-React for this chat\n"
         "!setradio <url> - Save a radio URL for this chat\n"
         "!radio - List stations or use: !radio <station-name> to play\n"
-        "!play <query or URL> - Play YouTube or reply to audio to play local\n"
+        "!play <query or URL> - Play YouTube or reply to an audio to play local\n"
         "!help - Show this message\n"
     )
 
-# react controller (posts inline controller)
 @user_app.on_message(filters.command("react", prefixes=["!", "/"]) & (filters.group | filters.channel) & filters.me)
 async def user_post_react_buttons(client: Client, message: Message):
     await ensure_owner_id()
@@ -801,7 +717,6 @@ async def user_post_react_buttons(client: Client, message: Message):
     )
     logger.info(f"Posted react controller in chat {chat_id} (msg {sent.message_id})")
 
-# New handler: allow sending "!react on" or "!react off" as direct commands from owner
 @user_app.on_message(filters.regex(r"^(?:!|/)react\s+(on|off)$") & filters.me)
 async def user_react_onoff_cmd(client: Client, message: Message):
     await ensure_owner_id()
@@ -937,7 +852,6 @@ async def user_handle_close(client: Client, cb: CallbackQuery):
     except Exception:
         await cb.answer("Could not delete message.", show_alert=True)
 
-# auto-react
 @user_app.on_message((filters.private | filters.group | filters.channel) & filters.incoming & ~filters.reply)
 async def auto_react(client: Client, message: Message):
     if getattr(message, "edit_date", None):
@@ -965,7 +879,6 @@ async def auto_react(client: Client, message: Message):
     except Exception:
         logger.exception("React failed")
 
-# setradio command
 @user_app.on_message(filters.command("setradio", prefixes=["!", "/"]) & filters.me)
 async def user_set_radio(client: Client, message: Message):
     await ensure_owner_id()
@@ -986,23 +899,19 @@ async def user_set_radio(client: Client, message: Message):
     set_radio(owner, chat_id, url)
     await message.reply_text("Saved radio URL. Use !radio to show it.")
 
-# radio command: list stations or play by name: "!radio HiruFM"
 @user_app.on_message(filters.command("radio", prefixes=["!", "/"]) & (filters.group | filters.channel | filters.me))
 async def cmd_radio_menu(_, message: Message):
     await ensure_owner_id()
     chat_id = message.chat.id
     owner = OWNER_ID
-    # If user supplied a station name or URL: play it directly
     parts = message.text.split(maxsplit=1)
     if len(parts) > 1:
         target = parts[1].strip()
-        # if user provided a known station name (case-insensitive)
         found = None
         for name in RADIO_STATION:
             if name.lower() == target.lower():
                 found = (name, RADIO_STATION[name])
                 break
-        # if provided a URL directly
         url = None
         title = None
         if found:
@@ -1013,55 +922,22 @@ async def cmd_radio_menu(_, message: Message):
         else:
             await message.reply_text("Station not found. Use `!radio` to list stations.")
             return
-
-        # Prepare entry and play
         entry = {"title": title or "Radio", "stream_url": url, "webpage": None, "thumbnail": None, "duration": None, "is_local": False}
         if not call_py:
             await message.reply_text(f"▶️ {title}\n{url}")
             return
-        # If CALL_CLIENT is assistant, ensure assistant is in chat, otherwise user_app will be used
-        if CALL_CLIENT is not None and CALL_CLIENT != user_app:
-            try:
-                assistant_user = await CALL_CLIENT.get_me()
-                assistant_id = assistant_user.id
-            except Exception:
-                assistant_id = None
-            assistant_present = False
-            if assistant_id:
-                try:
-                    await CALL_CLIENT.get_chat_member(chat_id, assistant_id)
-                    assistant_present = True
-                except Exception:
-                    assistant_present = False
-            if not assistant_present:
-                try:
-                    invite = await user_app.create_chat_invite_link(chat_id, member_limit=1, name="dlk_assistant_invite")
-                    invite_link = invite.invite_link
-                    try:
-                        await CALL_CLIENT.join_chat(invite_link)
-                        assistant_present = True
-                    except Exception:
-                        await message.reply_text("Assistant not in the group. Add it with the invite link and retry.")
-                        await message.reply_text(invite_link)
-                        return
-                except Exception:
-                    await message.reply_text("Assistant is not in this group. Please add the assistant account and try again.")
-                    return
         ok = await play_entry(chat_id, entry, reply_message=message)
         if ok:
             await message.reply_text(f"▶️ Now playing: {entry['title']}")
         else:
             await message.reply_text("❌ Failed to play the requested station.")
         return
-
-    # No arg: list available stations and usage
     lines = ["📻 Radio Stations (use `!radio <name>` to play):"]
     for name in RADIO_STATION:
         lines.append(f"- {name}")
     lines.append("\nOr set a per-chat radio URL with `!setradio <url>`.")
     await message.reply_text("\n".join(lines))
 
-# stations list command (shows station names & URLs)
 @user_app.on_message(filters.command("stations", prefixes=["!", "/"]) & filters.me)
 async def cmd_stations(client: Client, message: Message):
     lines = ["Available stations:"]
@@ -1069,11 +945,9 @@ async def cmd_stations(client: Client, message: Message):
         lines.append(f"- {name}: {url}")
     await message.reply_text("\n".join(lines))
 
-# play command: plays YouTube via call_py (assistant or user account) or local reply audio
 @user_app.on_message(filters.command("play", prefixes=["!", "/"]) & (filters.group | filters.channel))
 async def cmd_play(_, message: Message):
     chat_id = message.chat.id
-
     entry = None
     info_msg = None
     if message.reply_to_message:
@@ -1115,7 +989,6 @@ async def cmd_play(_, message: Message):
         except Exception:
             pass
         return
-
     ok = await play_entry(chat_id, entry, reply_message=message)
     if ok:
         try:
@@ -1130,7 +1003,6 @@ async def cmd_play(_, message: Message):
         except Exception:
             pass
 
-# skip/stop/queue commands
 @user_app.on_message(filters.command(["skip", "s"], prefixes=["!", "/"]) & (filters.group | filters.channel))
 async def cmd_skip(_, message: Message):
     chat_id = message.chat.id
@@ -1163,7 +1035,6 @@ async def general_stop_handler(_, message: Message):
     await leave_voice_chat(chat_id)
     await message.reply_text("Stopped & cleaned up.")
 
-# If any old inline callbacks arrive for radio playback, inform user they are disabled.
 @user_app.on_callback_query(filters.regex("^radio_play_"))
 async def play_radio_station(_, query: CallbackQuery):
     try:
@@ -1196,7 +1067,6 @@ async def cb_radio_close(_, query: CallbackQuery):
         except Exception:
             pass
 
-# playback controls callbacks adjusted to still work if triggered (pause/resume/stop/skip)
 @user_app.on_callback_query(filters.regex("^music_skip$"))
 async def cb_music_skip(_, query: CallbackQuery):
     if not await dlk_privilege_validator(query):
@@ -1302,6 +1172,47 @@ async def cb_radio_stop(_, query: CallbackQuery):
         logger.error(f"Stop failed via callback: {e}", exc_info=True)
         await query.answer("Failed to stop bot.", show_alert=True)
 
+# old inline callbacks for radio:
+@user_app.on_callback_query(filters.regex("^radio_play_"))
+async def play_radio_station_cb(_, query: CallbackQuery):
+    try:
+        station = query.data.replace("radio_play_", "")
+        url = RADIO_STATION.get(station)
+        chat_id = query.message.chat.id
+        if not url:
+            return await query.answer("Station URL not found!", show_alert=True)
+        if not call_py:
+            await query.answer("Voice playback not available (pytgcalls missing).", show_alert=True)
+            return
+        # cancel existing
+        if chat_id in radio_tasks:
+            radio_tasks[chat_id].cancel()
+            radio_tasks.pop(chat_id, None)
+        await asyncio.sleep(1)
+        await _safe_call_py_method("play", chat_id, MediaStream(url))
+        try:
+            await query.message.edit_caption(caption=f"🎧 Now Playing: {station}", reply_markup=player_controls_markup(chat_id))
+        except Exception:
+            try:
+                await query.message.reply_text(f"🎧 Now Playing: {station}", reply_markup=player_controls_markup(chat_id))
+            except Exception:
+                pass
+        start_time = time.time()
+        store_play_state(chat_id, station, url, query.message.message_id, start_time, elapsed=0.0, paused=False)
+        radio_tasks[chat_id] = asyncio.create_task(update_radio_timer(chat_id, query.message.message_id, station, start_time))
+        radio_paused.discard(chat_id)
+        await query.answer(f"Now playing {station}", show_alert=False)
+    except Exception as e:
+        logger.exception("radio_play failed")
+        try:
+            await leave_voice_chat(chat_id)
+        except Exception:
+            pass
+        try:
+            await query.answer("Failed to play station.", show_alert=True)
+        except Exception:
+            pass
+
 # ===================== START/STOP helpers =====================
 async def start_all():
     await user_app.start()
@@ -1312,8 +1223,6 @@ async def start_all():
             logger.info(session_str)
         except Exception:
             pass
-    if assistant:
-        await assistant.start()
     if call_py:
         try:
             call_py.start()
@@ -1322,12 +1231,6 @@ async def start_all():
     await ensure_owner_id()
     me = await user_app.get_me()
     logger.info(f"Userbot started as @{me.username or me.first_name} ({me.id})")
-    if assistant:
-        try:
-            a = await assistant.get_me()
-            logger.info(f"Assistant started as @{a.username} ({a.id})")
-        except Exception:
-            logger.info("Assistant started (username unknown).")
     if CALL_CLIENT is user_app:
         logger.info("Using userbot account for voice (PyTgCalls attached to user_app).")
 
@@ -1335,11 +1238,6 @@ async def stop_all():
     try:
         if call_py:
             call_py.stop()
-    except Exception:
-        pass
-    try:
-        if assistant:
-            await assistant.stop()
     except Exception:
         pass
     try:
